@@ -35,11 +35,31 @@
       // Native的方法名用 _ 作为前缀标记的，是返回值为 数据结构 的
       let isReturnDataStructure = apiName.startsWith('_')
       let newApiName = apiName.replace(/^_/, '')
+
+      // 转换成 Promise ，这样在 JS 调用的时候支持异步操作
       JSBridge[newApiName] = function(...args) {
         // 自动识别实参类型，如果是 `非Primitive` 的，自动转换成字符串传给 Native
         const newArgs = args.map(arg => isPrimitive(arg) ? arg : JSON.stringify(arg))
         let nativeReturnValue = StringJSBridge[apiName](...newArgs)
-        return isReturnDataStructure ? JSON.parse(nativeReturnValue) : nativeReturnValue
+        let uniqCallbackName = isReturnDataStructure ? JSON.parse(nativeReturnValue) : nativeReturnValue
+
+        console.log(args,newArgs, nativeReturnValue)
+        console.log(`apiName=${apiName}, isReturnDataStructure=${isReturnDataStructure},uniqCallbackName=${uniqCallbackName}`)
+        let promiseResolve, promiseReject;
+        let promise = new Promise((resolve, reject) => {
+          promiseResolve = resolve
+          promiseReject = reject
+
+        })
+        // 把 Native 返回的唯一回调函数名注册到 window 下，以供 Native 异步调用
+        window[uniqCallbackName + 'Success'] = function(data) {
+          promiseResolve(data.imageUri)
+        }
+        window[uniqCallbackName + 'Fail'] = function(errData) {
+          promiseReject(errData)
+        }
+        
+        return promise
       }
     })
 

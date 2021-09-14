@@ -7,6 +7,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -32,11 +33,30 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 
 import wang.jsbug.minipage.BuildConfig;
 import wang.jsbug.minipage.R;
 
+/**
+ * 首先明确2个术语：① Native ② JS
+ * JS 调用 Native 设计为异步得到 Native 的执行结果
+ * 因此我们封装一个 MinipageActivity ，作为其包含的 Webview 调用 Native 的桥梁。
+ *
+ * 这个 MinipageActivity 需要 3 个步骤（以 Native 方法通过 startActivityForResult(Intent intent, int requestCode) 执行 Native 操作为例）：
+ * 1. 调用 Webview.addJavascriptInterface(Object obj, String interfaceName) 注入 Native 方法到 JS 。
+ * 2. 通过 Activity.onActivityResult(int requestCode, int resultCode, Intent intent) 得到 Native 方法的执行结果
+ * 3. 通过 WebView.evaluateJavascript(String script, ValueCallback<String> resultCallback) 异步通知 JS
+ *
+ * 具体异步回调怎么做呢？
+ * 这就需要在 JS 层封装了，我们把这次叫做 JSSDK 。那以上的步骤细化如下：
+ * ① 步骤1注入的方法，返回一个由 Native 生成的唯一 CallbackName （字符串类型），JSSDK 也【约定】用这个 CallbackName 定义一个接受异步结果的回调函数
+ * ② 步骤3异步通知 JS，就是执行 JSSDK 定义的 CallbackName ，参数就是我们的数据啦
+ */
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
@@ -44,17 +64,28 @@ public class MainActivity extends AppCompatActivity {
     private boolean onPageFinished = false;
     private Uri imageUri; // 拍照的 Uri
 
+    private int callbackId = 0;
+    private String serviceName = "camera";
+
+    private static final String CALLBACK_SUFFIX_SUCCESS = "Success";
+    private static final String CALLBACK_SUFFIX_FAIL = "Fail";
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        String base = Environment.getExternalStorageDirectory().getAbsolutePath().toString();
+        Log.d(TAG, base);
+
         webView = (WebView) findViewById(R.id.webview);
 
         WebSettings webSettings = webView.getSettings();
         webSettings.setJavaScriptEnabled(true);
-        // 允许加载本地 file:/// 文件
+        // 允许加载本地 file:// 文件
         webSettings.setAllowUniversalAccessFromFileURLs(true);
+        webSettings.setAllowFileAccess(true);
+        webSettings.setAllowFileAccessFromFileURLs(true);
 
         // `WebChromeClient` 辅助 WebView 处理 JS 的对话框，网站图标，网站标题，加载进度等
         WebChromeClient webChromeClient = new WebChromeClient() {
@@ -86,6 +117,18 @@ public class MainActivity extends AppCompatActivity {
                 onPageFinished = true;
 
                 injectJsSDK();
+
+                webView.evaluateJavascript("javascript:location.hash='#/camera';console.log('执行了js')", new ValueCallback<String>() {
+                    @Override
+                    public void onReceiveValue(String value) {
+                        Log.d(TAG, "onReceiveValue(value): " + value);
+                    }
+                });
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                return true;
             }
         });
 
@@ -96,7 +139,7 @@ public class MainActivity extends AppCompatActivity {
         webView.loadUrl("file:///android_asset/html2image/dist/index.html");
 
         // 测试调用拍照功能
-        takePicture();
+        // takePicture();
     }
 
     /**
@@ -174,23 +217,44 @@ public class MainActivity extends AppCompatActivity {
 
             return data.toString();
         }
+
+        @JavascriptInterface
+        public String takePicture() {
+            ((MainActivity) context).takePicture();
+            return getUniqCallbackName();
+        }
     }
 
     public void takePicture() {
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+
         // 在临时目录创建一个文件，文件名为 .Pic.后缀
-        File photo = new File(getTempDirectoryPath(), ".Pic.png");
+        File photo = new File(getTempDirectoryPath(), ".Pic.jpg");
         // wang.jsbug.minipage.engine.plugin.camera.provider
+        // 在外部存储或cache目录
         this.imageUri = FileProvider.getUriForFile(this, BuildConfig.APPLICATION_ID + ".engine.plugin.camera.provider", photo);
+        // 设置图像输出 Uri
         intent.putExtra(MediaStore.EXTRA_OUTPUT, imageUri);
         intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-        // 对于不同的 Action ，如拍照、选择照片，格式如 png jpeg ，分别用不同的 requestCode ，此处做 demo 省略对应逻辑
-        int requestCode = 1;
-        startActivityForResult(intent, requestCode);
+        // 注意：多次调用，每次用唯一的 callbackId
+        callbackId++;
+        startActivityForResult(intent, callbackId);
     }
 
+    /**
+     * 获取唯一的Callback
+     * @return
+     */
+    private String getUniqCallbackName() {
+        return serviceName + callbackId;
+    }
+
+    /**
+     * 拍完照异步通知 JS
+     */
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent intent) {
+        /*
         if (resultCode == Activity.RESULT_OK) {
             // 得到新 Activity 关闭后返回的数据
             // 注意：如果内容是 base64 字符串，可以在 extra 获取，但是 Uri 类型的获取不到的
@@ -204,6 +268,54 @@ public class MainActivity extends AppCompatActivity {
                 ImageView imageView = (ImageView) findViewById(R.id.imageView);
                 imageView.setImageBitmap(bitmap);
             } catch (FileNotFoundException e) {
+                e.printStackTrace();
+            }
+        }
+         */
+
+        String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        String imageFileName = "IMG_" + timeStamp + ".jpg";
+        File file = new File(getTempDirectoryPath(), imageFileName);
+        JSONObject data = new JSONObject();
+        if (resultCode == Activity.RESULT_OK) {
+            try {
+                // 从 Uri 得到 Bitmap ，然后显示到 ImageView
+                InputStream inputStream = null;
+                FileOutputStream out = new FileOutputStream(file);
+                inputStream = getContentResolver().openInputStream(imageUri);
+                Bitmap bitmap = BitmapFactory.decodeStream(inputStream);
+                // 把位图压缩转换成 JPG 图片。
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 100, out);
+                out.flush();
+                out.close();
+
+                data.put("imageUri", "file://" + file.getAbsolutePath());
+                // 为了简化 JSSDK 的处理，回调总是JSON对象
+                webView.evaluateJavascript("javascript:" + getUniqCallbackName()  + CALLBACK_SUFFIX_SUCCESS + "(" + data.toString() + ")", new ValueCallback<String>() {
+                    @Override
+                    public void onReceiveValue(String value) {
+                        Log.i(TAG, "value is " + value);
+                    }
+                });
+            } catch (JSONException e) {
+                e.printStackTrace();
+            } catch (FileNotFoundException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        // 失败的情况
+        else {
+            try {
+                data.put("code", Activity.RESULT_OK);
+                webView.evaluateJavascript("javascript:" + getUniqCallbackName()  + CALLBACK_SUFFIX_FAIL + "(" + data.toString() + ")", new ValueCallback<String>() {
+                    @Override
+                    public void onReceiveValue(String value) {
+                        Log.i(TAG, "value is " + value);
+                    }
+                });
+            } catch (JSONException e) {
                 e.printStackTrace();
             }
         }
